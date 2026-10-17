@@ -3425,6 +3425,96 @@ describe("SDMAttachmentsService", () => {
       expect(mockReq.attachmentsToDelete).toBeUndefined();
       expect(mockReq.parentId).toBeUndefined();
     });
+
+    it("resolves a projected/named composition target via _target when deleting on save", async () => {
+      // Named composite-key composition: the attachment entity is NOT named
+      // "<parent>.<composition>", so the string-reconstruction lookup returns
+      // undefined and the removed attachment would never be collected. The
+      // _target resolution keeps delete-on-save working for these entities.
+      const activeAttachments = { name: "Test.MediaChild", "@_is_media_data": true };
+      cds.model.definitions["Test.Parent"] = {
+        elements: {
+          attachments: {
+            type: "cds.Composition",
+            target: "Test.MediaChild",
+            _target: activeAttachments,
+          },
+        },
+      };
+      // Deliberately NOT defining "Test.Parent.attachments" so the fallback cannot resolve.
+      delete cds.model.definitions["Test.Parent.attachments"];
+
+      const mockedReq = {
+        target: { name: "Test.Parent" },
+        user: { tokenInfo: { getTokenValue: jest.fn().mockReturnValue("tokenValue") } },
+        diff: jest.fn().mockResolvedValueOnce({
+          attachments: [{ _op: "delete", ID: "att-1" }],
+        }),
+        event: "UPDATE",
+        attachmentsToDelete: undefined,
+      };
+
+      getURLsToDeleteFromAttachments.mockReset();
+      getURLsToDeleteFromAttachments.mockResolvedValueOnce(["sdm-url-1"]);
+
+      await service.attachDeletionData(mockedReq);
+
+      expect(mockedReq.diff).toHaveBeenCalled();
+      expect(getURLsToDeleteFromAttachments).toHaveBeenCalledWith(["att-1"], activeAttachments);
+      expect(mockedReq.attachmentsToDelete).toEqual(["sdm-url-1"]);
+    });
+
+    it("skips entirely on a draft discard so saved attachments are never folder-deleted", async () => {
+      // A draft discard (DELETE targeting the draft sibling) must be left to
+      // attachDraftDeletionData. If attachDeletionData ran, req.diff() would
+      // surface the attachment removed in the draft and the whole folder would
+      // be deleteTree'd, destroying saved attachments.
+      const draftsDef = { name: "Test.Parent.drafts" };
+      const mockedReq = {
+        event: "DELETE",
+        target: { name: "Test.Parent", drafts: draftsDef },
+        subject: { ref: [{ id: "Test.Parent.drafts" }] },
+        diff: jest.fn(),
+      };
+
+      await service.attachDeletionData(mockedReq);
+
+      expect(mockedReq.diff).not.toHaveBeenCalled();
+      expect(getURLsToDeleteFromAttachments).not.toHaveBeenCalled();
+      expect(mockedReq.attachmentsToDelete).toBeUndefined();
+      expect(mockedReq.parentId).toBeUndefined();
+    });
+  });
+
+  describe("isDraftDiscard", () => {
+    let service;
+    beforeEach(() => {
+      jest.clearAllMocks();
+      service = new SDMAttachmentsService();
+    });
+
+    it("is true for a DELETE whose subject targets the draft sibling", () => {
+      const req = {
+        event: "DELETE",
+        target: { name: "Test.Parent", drafts: { name: "Test.Parent.drafts" } },
+        subject: { ref: [{ id: "Test.Parent.drafts" }] },
+      };
+      expect(service.isDraftDiscard(req)).toBe(true);
+    });
+
+    it("is false for an active-entity DELETE", () => {
+      const req = {
+        event: "DELETE",
+        target: { name: "Test.Parent", drafts: { name: "Test.Parent.drafts" } },
+        subject: { ref: [{ id: "Test.Parent" }] },
+      };
+      expect(service.isDraftDiscard(req)).toBe(false);
+    });
+
+    it("is false for non-DELETE events and non-draft entities", () => {
+      expect(service.isDraftDiscard({ event: "UPDATE", target: { name: "X", drafts: { name: "X.drafts" } }, subject: { ref: [{ id: "X.drafts" }] } })).toBe(false);
+      expect(service.isDraftDiscard({ event: "DELETE", target: { name: "X" }, subject: { ref: [{ id: "X" }] } })).toBe(false);
+    });
   });
 
   describe('attachURLsToDeleteFromAttachmentsDraft', () => {
@@ -5205,24 +5295,19 @@ describe("SDMAttachmentsService", () => {
       };
     });
   
-    it("should attach attachments to delete in req when they are present in drafts", async () => {
+    it("should attach unsaved draft attachments to delete per-object (never a folder deleteTree)", async () => {
       mockDraftAttachments = cds.model.definitions["testName.references.drafts"];
   
       const attachmentsToDelete = ["attachment1", "attachment2"];
       getURLsToDeleteFromDraftAttachments.mockResolvedValueOnce(attachmentsToDelete);
   
-      mockReq.diff.mockResolvedValueOnce({
-        references: ["attachment1", "attachment2"],
-      });
-  
-      setupDestinationMocks();
-      getFolderIdByIDAsPath.mockResolvedValueOnce("mock_folder_id");
-  
       await service.attachDraftDeletionData(mockReq);
   
       expect(getURLsToDeleteFromDraftAttachments).toHaveBeenCalledWith("mocked_id", mockDraftAttachments);
       expect(mockReq.attachmentsToDelete).toEqual(attachmentsToDelete);
-      expect(mockReq.parentId).toEqual(["mock_folder_id"]);
+      // Discard must NOT set parentId (that would deleteTree the whole folder,
+      // destroying saved attachments). Deletion is per-object instead.
+      expect(mockReq.parentId).toBeUndefined();
     });
   
     it("should not set `parentId` if the number of attachments in diff is different from `attachmentsToDelete`", async () => {
@@ -5263,6 +5348,19 @@ describe("SDMAttachmentsService", () => {
       expect(mockReq.parentId).toBeUndefined();
     });
 
+    it("should not set parentId when diff and draft-only deletes are both empty (0 === 0)", async () => {
+      getURLsToDeleteFromDraftAttachments.mockResolvedValueOnce([]);
+
+      mockReq.diff.mockResolvedValueOnce({
+        references: [],
+      });
+
+      await service.attachDraftDeletionData(mockReq);
+
+      expect(mockReq.attachmentsToDelete).toBeUndefined();
+      expect(mockReq.parentId).toBeUndefined();
+    });
+
     it("should not set parentId if folderId is not retrieved", async () => {
       const attachmentsToDelete = ["attachment1", "attachment2"];
       
@@ -5284,7 +5382,7 @@ describe("SDMAttachmentsService", () => {
       expect(mockReq.parentId).toBeUndefined();
     });
 
-    it("should resolve parent folder from composition path for multi-composition drafts", async () => {
+    it("collects unsaved urls per-object for multi-composition drafts without any folder lookup", async () => {
       service.creds = { uri: "https://sdm.example/" };
       getConfigurations.mockReturnValue({ repositoryId: "repo123" });
 
@@ -5306,49 +5404,48 @@ describe("SDMAttachmentsService", () => {
       mockReq.data = { ID: "entity-id-1" };
       getURLsToDeleteFromDraftAttachments.mockReset();
       getURLsToDeleteFromDraftAttachments.mockResolvedValueOnce(["url-1"]);
-      mockReq.diff.mockResolvedValueOnce({ references: ["url-1"] });
-      setupDestinationMocks();
-      executeHttpRequest.mockResolvedValueOnce({
-        data: { properties: { "cmis:objectId": { value: "multi-folder-id" } } }
-      });
 
       await service.attachDraftDeletionData(mockReq);
 
       expect(mockReq.attachmentsToDelete).toEqual(["url-1"]);
-      expect(mockReq.parentId).toEqual(["multi-folder-id"]);
+      // No parentId => deleteAttachmentsWithKeys deletes per-object, never deleteTree.
+      expect(mockReq.parentId).toBeUndefined();
+      // Discard must not perform any folder resolution.
       expect(getFolderIdByIDAsPath).not.toHaveBeenCalled();
     });
 
-    it("should skip parentId when multi-composition folder lookup fails", async () => {
-      service.creds = { uri: "https://sdm.example/" };
-      getConfigurations.mockReturnValue({ repositoryId: "repo123" });
-
-      cds.model.definitions["testName"] = {
-        name: "testName",
+    it("collects draft deletions for a projected composite-key composition", async () => {
+      const draftsDef = {
+        name: "Test.MediaChild.drafts",
+        keys: { up_: { keys: [{ $generatedFieldName: "up__ID" }] } },
+      };
+      cds.model.definitions["Test.Parent"] = {
+        name: "Test.Parent",
         elements: {
-          attachments: { type: "cds.Composition", target: "testName.attachments" },
-          references: { type: "cds.Composition", target: "testName.references" }
-        }
-      };
-      cds.model.definitions["testName.attachments"] = { includes: ["sap.attachments.Attachments"] };
-      cds.model.definitions["testName.references"] = { includes: ["sap.attachments.Attachments"] };
-      cds.model.definitions["testName.references.drafts"] = {
-        name: "testName.references.drafts",
-        includes: ["sap.attachments.Attachments"],
-        keys: { up_: { keys: [{ $generatedFieldName: "up__ID" }] } }
+          attachments: {
+            type: "cds.Composition",
+            target: "Test.MediaChild",
+            _target: {
+              name: "Test.MediaChild",
+              "@_is_media_data": true,
+              drafts: draftsDef,
+            },
+          },
+        },
       };
 
-      mockReq.data = { ID: "entity-id-1" };
+      mockReq.target = { name: "Test.Parent.drafts" };
+      mockReq.data = { ID: "parent-id-1" };
       getURLsToDeleteFromDraftAttachments.mockReset();
-      getURLsToDeleteFromDraftAttachments.mockResolvedValueOnce(["url-1"]);
-      mockReq.diff.mockResolvedValueOnce({ references: ["url-1"] });
-      setupDestinationMocks();
-      executeHttpRequest.mockRejectedValueOnce(new Error("folder not found"));
+      getURLsToDeleteFromDraftAttachments.mockResolvedValueOnce([{ url: "sdm-obj-1" }]);
+      // diff count intentionally mismatches so folder resolution is skipped;
+      // we only assert the attachment URLs were collected for deletion.
+      mockReq.diff.mockResolvedValueOnce({});
 
       await service.attachDraftDeletionData(mockReq);
 
-      expect(mockReq.attachmentsToDelete).toEqual(["url-1"]);
-      expect(mockReq.parentId).toBeUndefined();
+      expect(getURLsToDeleteFromDraftAttachments).toHaveBeenCalledWith("parent-id-1", draftsDef);
+      expect(mockReq.attachmentsToDelete).toEqual([{ url: "sdm-obj-1" }]);
     });
   });
 
@@ -5873,6 +5970,106 @@ describe("SDMAttachmentsService", () => {
         
         expect(result).toEqual([compositionName]);
       });
+    });
+  });
+
+  describe('getAttachmentCompositions - projected/named composition', () => {
+    let service;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      service = new SDMAttachmentsService();
+    });
+
+    it('detects a projected media composition via @_is_media_data even when the target has no includes', () => {
+      const draftsDef = {
+        name: 'Test.MediaChild.drafts',
+        keys: { up_: { keys: [{ $generatedFieldName: 'up__ID' }] } },
+      };
+      const attachmentsTarget = {
+        name: 'Test.MediaChild',
+        '@_is_media_data': true,
+        drafts: draftsDef,
+        // NOTE: a projection carries no `includes` for the Attachments aspect
+      };
+      cds.model.definitions['Test.Parent'] = {
+        elements: {
+          attachments: {
+            type: 'cds.Composition',
+            target: 'Test.MediaChild',
+            _target: attachmentsTarget,
+          },
+        },
+      };
+
+      const result = service.getAttachmentCompositions({ name: 'Test.Parent' });
+
+      expect(result).toEqual(['attachments']);
+    });
+
+    it('does not detect a non-media projected composition', () => {
+      cds.model.definitions['Test.Parent'] = {
+        elements: {
+          notes: {
+            type: 'cds.Composition',
+            target: 'Test.Notes',
+            _target: { name: 'Test.Notes' },
+          },
+        },
+      };
+
+      const result = service.getAttachmentCompositions({ name: 'Test.Parent' });
+
+      expect(result).toEqual([]);
+    });
+  });
+
+  describe('getDraftAttachmentsEntity', () => {
+    let service;
+
+    beforeEach(() => {
+      jest.clearAllMocks();
+      service = new SDMAttachmentsService();
+    });
+
+    it('returns the resolved _target.drafts for a named composition entity', () => {
+      const draftsDef = { name: 'Test.MediaChild.drafts' };
+      cds.model.definitions['Test.Parent'] = {
+        elements: {
+          attachments: {
+            type: 'cds.Composition',
+            target: 'Test.MediaChild',
+            _target: { name: 'Test.MediaChild', drafts: draftsDef },
+          },
+        },
+      };
+
+      const result = service.getDraftAttachmentsEntity('Test.Parent', 'attachments');
+
+      expect(result).toBe(draftsDef);
+    });
+
+    it('falls back to <parent>.<composition>.drafts for inline compositions', () => {
+      const draftsDef = { name: 'testName.references.drafts' };
+      cds.model.definitions['testName'] = {
+        elements: { references: { type: 'cds.Composition', target: 'testName.references' } },
+      };
+      cds.model.definitions['testName.references.drafts'] = draftsDef;
+
+      const result = service.getDraftAttachmentsEntity('testName', 'references');
+
+      expect(result).toBe(draftsDef);
+    });
+
+    it('returns undefined when neither resolved nor reconstructed draft entity exists', () => {
+      cds.model.definitions['testName'] = {
+        elements: { references: { type: 'cds.Composition', target: 'testName.references' } },
+      };
+      delete cds.model.definitions['testName.references.drafts'];
+
+      const result = service.getDraftAttachmentsEntity('testName', 'references');
+
+      expect(result).toBeUndefined();
     });
   });
 
