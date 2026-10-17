@@ -1956,6 +1956,9 @@ describe("SDMAttachmentsService", () => {
         target: {
             name: 'Attachments'
         },
+        params: [
+            { ID: attachmentId }
+        ],
         data: {
             url: 'http://new-link.com'
         },
@@ -2587,6 +2590,7 @@ describe("SDMAttachmentsService", () => {
       const req = {
         target: { name: "MyEntity" },
         req: { url: "/MyEntity(ID=123e4567-e89b-12d3-a456-426614174000)" },
+        params: [{ ID: "123e4567-e89b-12d3-a456-426614174000" }],
         user: {
           tokenInfo: {
             getTokenValue: jest.fn().mockReturnValue("mockToken")
@@ -2886,10 +2890,11 @@ describe("SDMAttachmentsService", () => {
         },
         params: [
           {
-            ID: '12345'
+            ID: 'c66fcc09-90c5-4026-acde-19ef5297cd7f'
           },
           {
-            ID: '12345'
+            ID: 'afc3d040-60ae-4bf2-a44f-1da4043f4257',
+            up__ID: 'c66fcc09-90c5-4026-acde-19ef5297cd7f'
           }
         ],
         target: draftAttachments,
@@ -2913,6 +2918,54 @@ describe("SDMAttachmentsService", () => {
       expect(req.data.content).toBeNull();
     });
 
+    // Regression: composite-key attachments emit a URL
+    // where the attachment's own ID appears BEFORE up__ID
+    // (".../attachments(ID=<attachment>,up__ID=<parent>,...)"). The old regex
+    // greedily matched the LAST "ID=" and therefore picked up__ID (the parent),
+    // uploading against the wrong record. Resolving from req.params.at(-1).ID
+    // always yields the attachment's own key regardless of URL key order.
+    test('should upload the correct attachment for composite-key entities when the attachment ID precedes up__ID in the URL', async () => {
+      const draftAttachments = [];
+      const parentId = '1cf0de7a-e2af-4b70-a844-b29708d8944b';
+      const attachmentGuid = 'e83d196c-970a-4054-a7ec-9d900cfdfc20';
+      const req = {
+        req: {
+          // Assessments-style URL: attachment ID first, parent up__ID last.
+          url: `/Assessments(ID=${parentId},IsActiveEntity=false)/attachments(ID=${attachmentGuid},up__ID=${parentId},IsActiveEntity=false)/content`
+        },
+        data: {
+          content: 'some content'
+        },
+        params: [
+          { ID: parentId },
+          { ID: attachmentGuid, up__ID: parentId }
+        ],
+        target: draftAttachments,
+        user: {
+          tokenInfo: {
+            getTokenValue: jest.fn().mockReturnValue('mockTokenValue')
+          }
+        }
+      };
+      const attachment_val = [
+        { HasActiveEntity: false, ID: attachmentGuid, filename: 'sample.txt' },
+        // Decoy whose ID equals the parent up__ID: the old regex would have
+        // matched this one and uploaded against the wrong record.
+        { HasActiveEntity: false, ID: parentId, filename: 'parent-decoy.txt' },
+      ];
+      getDraftAttachmentsForUpID.mockResolvedValue(attachment_val);
+      setupDestinationMocks();
+
+      await service.draftAttachmentUploadHandler(req);
+
+      expect(service.create).toHaveBeenCalledWith(
+        [{ ...attachment_val[0], content: 'some content' }],
+        draftAttachments,
+        req
+      );
+      expect(req.data.content).toBeNull();
+    });
+  
 
     test('should not create attachment if no matching inactive entities are found', async () => {
       const draftAttachments = [];
@@ -2993,10 +3046,11 @@ describe("SDMAttachmentsService", () => {
         },
         params:[
           {
-            ID: '12345'
+            ID: 'c66fcc09-90c5-4026-acde-19ef5297cd7f'
           },
           {
-            ID: '12345'
+            ID: 'afc3d040-60ae-4bf2-a44f-1da4043f4257',
+            up__ID: 'c66fcc09-90c5-4026-acde-19ef5297cd7f'
           }
         ],
         target: draftAttachments,
@@ -3062,10 +3116,11 @@ describe("SDMAttachmentsService", () => {
         content: 'some content' },
         params: [
           {
-            ID: '12345'
+            ID: 'c66fcc09-90c5-4026-acde-19ef5297cd7f'
           },
           {
-            ID: '12345'
+            ID: 'afc3d040-60ae-4bf2-a44f-1da4043f4257',
+            up__ID: 'c66fcc09-90c5-4026-acde-19ef5297cd7f'
           }
         ],
         target: draftAttachments,
@@ -3851,6 +3906,7 @@ describe("SDMAttachmentsService", () => {
       req = {
         target: { name: "MyEntity" },
         req: { url: "/MyEntity(ID=123e4567-e89b-12d3-a456-426614174000)" },
+        params: [{ ID: "123e4567-e89b-12d3-a456-426614174000" }],
         user: {
           tokenInfo: {
             getTokenValue: jest.fn().mockReturnValue("mockToken")
@@ -3926,9 +3982,49 @@ describe("SDMAttachmentsService", () => {
       expect(result).toEqual({ value: "None" });
     });
 
-    it('should handle missing match in URL gracefully', async () => {
+    it('should resolve attachment ID from req.params even when the URL is non-standard', async () => {
+      // The attachment ID is taken from req.params (CAP keys), not by parsing
+      // the URL, so a non-standard/opaque URL must not affect resolution.
       req.req.url = "/MyEntity(ID=invalid)";
-      await expect(service.openAttachment(req)).rejects.toThrow();
+      getMetadataForOpenAttachment.mockResolvedValueOnce({
+        filename: "file.url",
+        mimeType: "application/internet-shortcut",
+        linkUrl: "http://example.com"
+      });
+
+      const result = await service.openAttachment(req);
+
+      expect(getMetadataForOpenAttachment).toHaveBeenCalledWith(
+        { ID: "123e4567-e89b-12d3-a456-426614174000" },
+        cds.model.definitions.MyEntity
+      );
+      expect(result).toEqual({ value: "http://example.com" });
+    });
+
+    // Regression: composite-key attachment where the attachment ID precedes
+    // up__ID in the URL. Must resolve the attachment's own key (params.at(-1)),
+    // not the parent up__ID that a greedy "last ID=" regex would have matched.
+    it('should resolve the attachment key (not up__ID) for composite-key entities', async () => {
+      const parentId = "1cf0de7a-e2af-4b70-a844-b29708d8944b";
+      const attachmentGuid = "e83d196c-970a-4054-a7ec-9d900cfdfc20";
+      req.req.url = `/Assessments(ID=${parentId})/attachments(ID=${attachmentGuid},up__ID=${parentId})`;
+      req.params = [
+        { ID: parentId },
+        { ID: attachmentGuid, up__ID: parentId }
+      ];
+      getMetadataForOpenAttachment.mockResolvedValueOnce({
+        filename: "file.url",
+        mimeType: "application/internet-shortcut",
+        linkUrl: "http://example.com"
+      });
+
+      const result = await service.openAttachment(req);
+
+      expect(getMetadataForOpenAttachment).toHaveBeenCalledWith(
+        { ID: attachmentGuid },
+        cds.model.definitions.MyEntity
+      );
+      expect(result).toEqual({ value: "http://example.com" });
     });
   });
 
@@ -4224,6 +4320,9 @@ describe("SDMAttachmentsService", () => {
         target: {
             name: 'Attachments'
         },
+        params: [
+            { ID: attachmentId }
+        ],
         data: {
             url: 'http://new-link.com'
         },
@@ -8794,6 +8893,7 @@ describe("SDMAttachmentsService", () => {
         const req = {
           req: { url: `/Attachments(ID=${attachmentId})` },
           target: { name: 'Attachments' },
+          params: [{ ID: attachmentId }],
           data: { url: 'https://updated-url.com' },
           reject: jest.fn()
         };
